@@ -3,7 +3,7 @@ import signal
 import time
 from time import sleep
 
-Port = 10006
+Port = 10008
 
 class ApiException(Exception):
     pass
@@ -22,7 +22,6 @@ shutdown = False
 ORDER_LIMIT = 10  # orders per second (adjust based on actual rate limit)
 MAX_ORDER_SIZE = 10000
 POSITION_LIMIT = 25000
-MIN_PRICE_DIFFERENCE = 0.00  # Minimum price spread in dollars
 
 # Speed bump tracking
 number_of_orders = 0
@@ -30,7 +29,6 @@ total_speedbumps = 0
 
 # Statistics tracking
 opportunities_found = 0
-opportunities_skipped = 0
 trades_executed = 0
 evaluations = 0
 expected_total_profit = 0
@@ -73,8 +71,7 @@ def get_realized_profits(session):
     return total_realized
 
 def get_order_books(session):
-    """Get order books for both exchanges - Top of book only for speed"""
-    # Changed limit from 20 to 1 to reduce data overhead
+    """Get order books for both exchanges - TOP OF BOOK ONLY"""
     crzy_m_resp = session.get(f'http://localhost:{Port}/v1/securities/book?ticker=CRZY_M&limit=1')
     crzy_a_resp = session.get(f'http://localhost:{Port}/v1/securities/book?ticker=CRZY_A&limit=1')
     
@@ -85,32 +82,6 @@ def get_order_books(session):
     crzy_a_book = crzy_a_resp.json()
     
     return crzy_m_book, crzy_a_book
-
-def get_best_price_and_quantity(order_book_side, desired_quantity):
-    """
-    Get the best price and available quantity from the top of the order book.
-    Replaces the complex VWAP calculation for speed.
-    Returns: (price, available_quantity, total_cost)
-    """
-    if not order_book_side:
-        return None, 0, 0
-    
-    # Just grab the first level (Top of Book)
-    best_level = order_book_side[0]
-    price = best_level['price']
-    
-    # Calculate how much is actually available at this top price
-    available_at_level = best_level['quantity'] - best_level['quantity_filled']
-    
-    if available_at_level <= 0:
-        return None, 0, 0
-
-    # We can only trade what is available at the top level
-    quantity_to_trade = min(available_at_level, desired_quantity)
-    
-    total_cost = quantity_to_trade * price
-    
-    return price, quantity_to_trade, total_cost
 
 def submit_order(session, ticker, action, quantity):
     """Submit a market order"""
@@ -144,33 +115,27 @@ def speedbump(transaction_time):
     # Calculate speed bump for current order
     order_speedbump = -transaction_time + 1/ORDER_LIMIT
     
-    # Only apply if positive (otherwise transaction was already slow enough)
-    if order_speedbump > 0:
-        # Add to total
-        total_speedbumps = total_speedbumps + order_speedbump
-        
-        # Increment order counter
-        number_of_orders = number_of_orders + 1
-        
-        # Sleep for average speed bump
-        avg_speedbump = total_speedbumps / number_of_orders
-        
-        print(f"   ⏱️  Speed bump: {avg_speedbump:.3f}s (txn: {transaction_time:.3f}s)")
+    # Add to total
+    total_speedbumps = total_speedbumps + order_speedbump
+    
+    # Increment order counter
+    number_of_orders = number_of_orders + 1
+    
+    # Sleep for average speed bump (only if positive)
+    avg_speedbump = total_speedbumps / number_of_orders
+    if avg_speedbump > 0:
         sleep(avg_speedbump)
-    else:
-        # Transaction was slow, no need for additional delay
-        number_of_orders = number_of_orders + 1
-        print(f"   ⏱️  No speed bump needed (txn was slow: {transaction_time:.3f}s)")
 
-def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, buy_price, sell_price, expected_profit):
+def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, buy_price, sell_price):
     """Execute arbitrage by buying on one exchange and selling on the other"""
     global expected_total_profit
     
+    expected_profit = (sell_price - buy_price) * quantity
+    
     print(f"\n{'='*70}")
-    print(f"🎯 ARBITRAGE OPPORTUNITY - EXECUTING!")
+    print(f"🎯 ARBITRAGE OPPORTUNITY DETECTED!")
     print(f"   Buy  {quantity:,} shares on {buy_ticker} @ ${buy_price:.2f}")
     print(f"   Sell {quantity:,} shares on {sell_ticker} @ ${sell_price:.2f}")
-    print(f"   Price difference: ${sell_price - buy_price:.2f}")
     print(f"   Expected profit: ${expected_profit:.2f}")
     print(f"{'='*70}")
     
@@ -202,16 +167,10 @@ def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, buy_price, sel
     filled_quantity = min(buy_order['quantity_filled'], sell_order['quantity_filled'])
     actual_profit = (sell_order['vwap'] - buy_order['vwap']) * filled_quantity
     
-    print(f"💰 Actual profit: ${actual_profit:.2f} (Expected: ${expected_profit:.2f})")
-    
     # Add to expected total profit
     expected_total_profit += expected_profit
     
-    if actual_profit < 0:
-        print(f"⚠️  WARNING: Lost money on this trade!")
-    elif actual_profit < expected_profit * 0.8:
-        print(f"⚠️  WARNING: Profit much lower than expected (slippage)")
-    
+    print(f"💰 Actual profit: ${actual_profit:.2f}")
     print(f"{'='*70}\n")
     
     return True
@@ -248,8 +207,7 @@ def print_period_stats(session, period):
     print("\n" + "="*70)
     print(f"📊 PERIOD {period} COMPLETED - Statistics:")
     print(f"   Evaluations: {evaluations}")
-    print(f"   Profitable opportunities found: {opportunities_found}")
-    print(f"   Small opportunities skipped: {opportunities_skipped}")
+    print(f"   Opportunities found: {opportunities_found}")
     print(f"   Trades executed: {trades_executed}")
     print(f"   Total orders submitted: {number_of_orders}")
     print(f"   Expected total profit: ${expected_total_profit:.2f}")
@@ -264,19 +222,19 @@ def print_period_stats(session, period):
     print("="*70 + "\n")
 
 def main():
-    global shutdown, opportunities_found, opportunities_skipped, trades_executed, evaluations, expected_total_profit
+    global shutdown, opportunities_found, trades_executed, evaluations, expected_total_profit
+    global number_of_orders, total_speedbumps
     
     with requests.Session() as s:
         s.headers.update(API_KEY)
         
         print("\n" + "="*70)
-        print(" ALGORITHMIC ARBITRAGE BOT - ALGO1 Case (Speed Edition)")
+        print(" ALGORITHMIC ARBITRAGE BOT - ALGO1 Case (Simple Edition)")
         print("="*70)
         print(f"Position Limit: ±{POSITION_LIMIT:,} shares (gross/net)")
         print(f"Max Order Size: {MAX_ORDER_SIZE:,} shares")
         print(f"Rate Limit: {ORDER_LIMIT} orders/second")
-        print(f"Min Price Difference: ${MIN_PRICE_DIFFERENCE:.2f}")
-        print(f"Strategy: Simple Top-of-Book Compare (High Speed)")
+        print(f"Strategy: Top-of-book market orders - FAST execution")
         print("="*70 + "\n")
         
         # Wait for case to start
@@ -284,7 +242,7 @@ def main():
             print("❌ Shutdown before case started")
             return
         
-        print("🤖 Bot started. Monitoring markets for profitable arbitrage...\n")
+        print("🤖 Bot started. Monitoring markets for arbitrage opportunities...\n")
         
         last_period = 0
         last_status = 'ACTIVE'
@@ -302,10 +260,11 @@ def main():
                         
                         # Reset counters for new period
                         opportunities_found = 0
-                        opportunities_skipped = 0
                         trades_executed = 0
                         evaluations = 0
                         expected_total_profit = 0
+                        number_of_orders = 0
+                        total_speedbumps = 0
                     
                     last_period = period
                 
@@ -336,7 +295,7 @@ def main():
                     sleep(1)
                     continue
                 
-                # Get order books (Top of book only)
+                # Get order books (TOP OF BOOK ONLY - fast!)
                 crzy_m_book, crzy_a_book = get_order_books(s)
                 
                 # Check if books have valid data
@@ -351,68 +310,54 @@ def main():
                 # Increment evaluation counter
                 evaluations += 1
                 
-                # Calculate maximum quantity we can trade (before checking arbitrage)
-                max_quantity = min(MAX_ORDER_SIZE, remaining_capacity)
+                # Extract best bid/ask for both exchanges
+                crzy_m_bid = crzy_m_book['bids'][0]['price']
+                crzy_m_ask = crzy_m_book['asks'][0]['price']
+                crzy_m_bid_size = crzy_m_book['bids'][0]['quantity'] - crzy_m_book['bids'][0]['quantity_filled']
+                crzy_m_ask_size = crzy_m_book['asks'][0]['quantity'] - crzy_m_book['asks'][0]['quantity_filled']
                 
-                best_opportunity = None
-                best_profit = 0
-                best_spread = 0
+                crzy_a_bid = crzy_a_book['bids'][0]['price']
+                crzy_a_ask = crzy_a_book['asks'][0]['price']
+                crzy_a_bid_size = crzy_a_book['bids'][0]['quantity'] - crzy_a_book['bids'][0]['quantity_filled']
+                crzy_a_ask_size = crzy_a_book['asks'][0]['quantity'] - crzy_a_book['asks'][0]['quantity_filled']
+                
+                # Check for arbitrage opportunities
                 
                 # Opportunity 1: Buy on Main, Sell on Alternate (M ask < A bid)
-                buy_m_price, buy_m_qty, _ = get_best_price_and_quantity(crzy_m_book['asks'], max_quantity)
-                sell_a_price, sell_a_qty, _ = get_best_price_and_quantity(crzy_a_book['bids'], max_quantity)
-                
-                if buy_m_price is not None and sell_a_price is not None:
-                    # We are now just comparing simple prices, not VWAP
-                    price_spread = sell_a_price - buy_m_price
+                if crzy_m_ask < crzy_a_bid:
+                    opportunities_found += 1
                     
-                    # Quantity is limited by what is at the top level
-                    available_quantity = min(buy_m_qty, sell_a_qty, max_quantity)
+                    # Calculate maximum quantity we can trade
+                    max_quantity = min(
+                        crzy_m_ask_size,      # Liquidity on Main ask
+                        crzy_a_bid_size,      # Liquidity on Alternate bid
+                        MAX_ORDER_SIZE,       # Per-order limit
+                        remaining_capacity    # Position limit
+                    )
                     
-                    if available_quantity > 0 and price_spread > 0:
-                        expected_profit = price_spread * available_quantity
-                        
-                        if expected_profit > best_profit:
-                            best_profit = expected_profit
-                            best_spread = price_spread
-                            best_opportunity = ('CRZY_M', 'CRZY_A', available_quantity, buy_m_price, sell_a_price, expected_profit)
+                    if max_quantity > 0:
+                        if execute_arbitrage(s, 'CRZY_M', 'CRZY_A', max_quantity, crzy_m_ask, crzy_a_bid):
+                            trades_executed += 1
                 
                 # Opportunity 2: Buy on Alternate, Sell on Main (A ask < M bid)
-                buy_a_price, buy_a_qty, _ = get_best_price_and_quantity(crzy_a_book['asks'], max_quantity)
-                sell_m_price, sell_m_qty, _ = get_best_price_and_quantity(crzy_m_book['bids'], max_quantity)
-                
-                if buy_a_price is not None and sell_m_price is not None:
-                    # Simple price comparison
-                    price_spread = sell_m_price - buy_a_price
+                elif crzy_a_ask < crzy_m_bid:
+                    opportunities_found += 1
                     
-                    # Quantity is limited by what is at the top level
-                    available_quantity = min(buy_a_qty, sell_m_qty, max_quantity)
+                    # Calculate maximum quantity we can trade
+                    max_quantity = min(
+                        crzy_a_ask_size,      # Liquidity on Alternate ask
+                        crzy_m_bid_size,      # Liquidity on Main bid
+                        MAX_ORDER_SIZE,       # Per-order limit
+                        remaining_capacity    # Position limit
+                    )
                     
-                    if available_quantity > 0 and price_spread > 0:
-                        expected_profit = price_spread * available_quantity
-                        
-                        if expected_profit > best_profit:
-                            best_profit = expected_profit
-                            best_spread = price_spread
-                            best_opportunity = ('CRZY_A', 'CRZY_M', available_quantity, buy_a_price, sell_m_price, expected_profit)
-                
-                # Print evaluation status and execute if spread is large enough
-                if best_opportunity:
-                    if best_spread > MIN_PRICE_DIFFERENCE:
-                        print(f"✨ [Tick {tick:3d}] Evaluation #{evaluations}: EXECUTING trade, spread=${best_spread:.2f}, profit=${best_profit:.2f}")
-                        opportunities_found += 1
-                        buy_tkr, sell_tkr, qty, buy_price, sell_price, profit = best_opportunity
-                        if execute_arbitrage(s, buy_tkr, sell_tkr, qty, buy_price, sell_price, profit):
+                    if max_quantity > 0:
+                        if execute_arbitrage(s, 'CRZY_A', 'CRZY_M', max_quantity, crzy_a_ask, crzy_m_bid):
                             trades_executed += 1
-                    else:
-                        opportunities_skipped += 1
-                        print(f"⏭️  [Tick {tick:3d}] Evaluation #{evaluations}: Small spread ${best_spread:.4f} < ${MIN_PRICE_DIFFERENCE:.2f} (skipped)")
-                else:
-                    # Print status every 20 evaluations to show we're alive
-                    if evaluations % 20 == 0:
-                        print(f"🔍 [Tick {tick:3d}] Evaluation #{evaluations}: No arbitrage opportunity")
                 
-                # No fixed sleep here - we rely on the speedbump function when trades happen
+                # Print status every 50 evaluations to show we're alive
+                elif evaluations % 50 == 0:
+                    print(f"🔍 [Tick {tick:3d}] Evaluation #{evaluations}: No arbitrage (M: {crzy_m_bid:.2f}/{crzy_m_ask:.2f}, A: {crzy_a_bid:.2f}/{crzy_a_ask:.2f})")
                 
             except KeyboardInterrupt:
                 shutdown = True
@@ -426,8 +371,7 @@ def main():
         print("🛑 Bot manually stopped.")
         print(f"📊 Final Statistics:")
         print(f"   Evaluations: {evaluations}")
-        print(f"   Profitable opportunities found: {opportunities_found}")
-        print(f"   Small opportunities skipped: {opportunities_skipped}")
+        print(f"   Opportunities found: {opportunities_found}")
         print(f"   Trades executed: {trades_executed}")
         print(f"   Total orders submitted: {number_of_orders}")
         print(f"   Expected total profit: ${expected_total_profit:.2f}")

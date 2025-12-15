@@ -22,11 +22,18 @@ shutdown = False
 ORDER_LIMIT = 10  # orders per second (adjust based on actual rate limit)
 MAX_ORDER_SIZE = 10000
 POSITION_LIMIT = 25000
-MIN_PROFIT_THRESHOLD = 100  # Minimum profit in $ to execute trade
+MIN_PRICE_DIFFERENCE = 0.00  # Minimum price spread in dollars
 
 # Speed bump tracking
 number_of_orders = 0
 total_speedbumps = 0
+
+# Statistics tracking
+opportunities_found = 0
+opportunities_skipped = 0
+trades_executed = 0
+evaluations = 0
+expected_total_profit = 0
 
 def get_tick(session):
     """Get current tick of the case"""
@@ -34,7 +41,7 @@ def get_tick(session):
     if resp.status_code == 401:
         raise ApiException('API key mismatch')
     case = resp.json()
-    return case['tick'], case['status']
+    return case['tick'], case['status'], case['period']
 
 def get_limits(session):
     """Get current trading limits"""
@@ -49,6 +56,21 @@ def get_limits(session):
             return limit['gross'], limit['net'], limit['gross_limit'], limit['net_limit']
     
     return 0, 0, POSITION_LIMIT, POSITION_LIMIT
+
+def get_realized_profits(session):
+    """Get actual realized profits from the server"""
+    resp = session.get(f'http://localhost:{Port}/v1/securities')
+    if resp.status_code == 401:
+        raise ApiException('API key mismatch')
+    
+    securities = resp.json()
+    total_realized = 0
+    
+    for security in securities:
+        if security['ticker'] in ['CRZY_M', 'CRZY_A']:
+            total_realized += security.get('realized', 0)
+    
+    return total_realized
 
 def get_order_books(session):
     """Get order books for both exchanges - get more depth"""
@@ -133,24 +155,33 @@ def speedbump(transaction_time):
     # Calculate speed bump for current order
     order_speedbump = -transaction_time + 1/ORDER_LIMIT
     
-    # Add to total
-    total_speedbumps = total_speedbumps + order_speedbump
-    
-    # Increment order counter
-    number_of_orders = number_of_orders + 1
-    
-    # Sleep for average speed bump
-    avg_speedbump = total_speedbumps / number_of_orders
-    # if avg_speedbump > 0:
-    sleep(avg_speedbump)
+    # Only apply if positive (otherwise transaction was already slow enough)
+    if order_speedbump > 0:
+        # Add to total
+        total_speedbumps = total_speedbumps + order_speedbump
+        
+        # Increment order counter
+        number_of_orders = number_of_orders + 1
+        
+        # Sleep for average speed bump
+        avg_speedbump = total_speedbumps / number_of_orders
+        
+        print(f"   ⏱️  Speed bump: {avg_speedbump:.3f}s (txn: {transaction_time:.3f}s)")
+        sleep(avg_speedbump)
+    else:
+        # Transaction was slow, no need for additional delay
+        number_of_orders = number_of_orders + 1
+        print(f"   ⏱️  No speed bump needed (txn was slow: {transaction_time:.3f}s)")
 
 def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, expected_buy_vwap, expected_sell_vwap, expected_profit):
     """Execute arbitrage by buying on one exchange and selling on the other"""
+    global expected_total_profit
     
     print(f"\n{'='*70}")
     print(f"🎯 ARBITRAGE OPPORTUNITY - EXECUTING!")
     print(f"   Buy  {quantity:,} shares on {buy_ticker} @ ~${expected_buy_vwap:.4f} (VWAP)")
     print(f"   Sell {quantity:,} shares on {sell_ticker} @ ~${expected_sell_vwap:.4f} (VWAP)")
+    print(f"   Price difference: ${expected_sell_vwap - expected_buy_vwap:.4f}")
     print(f"   Expected profit: ${expected_profit:.2f}")
     print(f"{'='*70}")
     
@@ -184,6 +215,9 @@ def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, expected_buy_v
     
     print(f"💰 Actual profit: ${actual_profit:.2f} (Expected: ${expected_profit:.2f})")
     
+    # Add to expected total profit
+    expected_total_profit += expected_profit
+    
     if actual_profit < 0:
         print(f"⚠️  WARNING: Lost money on this trade!")
     elif actual_profit < expected_profit * 0.8:
@@ -193,8 +227,55 @@ def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, expected_buy_v
     
     return True
 
+def wait_for_case_start(session):
+    """Wait for the case to start (status = ACTIVE and ticks moving)"""
+    print("⏳ Waiting for case to start...")
+    
+    last_tick = -1
+    while not shutdown:
+        try:
+            tick, status, period = get_tick(session)
+            
+            if status == 'ACTIVE':
+                if tick > last_tick or tick == 0:
+                    print(f"✅ Case is ACTIVE! Period {period}, Tick {tick}")
+                    return True
+                else:
+                    print(f"   Case ACTIVE but ticks not moving... Tick: {tick}")
+            else:
+                print(f"   Case status: {status}, waiting...")
+            
+            last_tick = tick
+            sleep(0.5)
+            
+        except Exception as e:
+            print(f"   Error checking case status: {e}")
+            sleep(2)
+    
+    return False
+
+def print_period_stats(session, period):
+    """Print statistics for the completed period"""
+    print("\n" + "="*70)
+    print(f"📊 PERIOD {period} COMPLETED - Statistics:")
+    print(f"   Evaluations: {evaluations}")
+    print(f"   Profitable opportunities found: {opportunities_found}")
+    print(f"   Small opportunities skipped: {opportunities_skipped}")
+    print(f"   Trades executed: {trades_executed}")
+    print(f"   Total orders submitted: {number_of_orders}")
+    print(f"   Expected total profit: ${expected_total_profit:.2f}")
+    
+    # Get actual realized profit from server
+    try:
+        actual_profit = get_realized_profits(session)
+        print(f"   💰 Actual realized profit: ${actual_profit:.2f}")
+    except Exception as e:
+        print(f"   💰 Could not retrieve actual profit from server: {e}")
+    
+    print("="*70 + "\n")
+
 def main():
-    global shutdown
+    global shutdown, opportunities_found, opportunities_skipped, trades_executed, evaluations, expected_total_profit
     
     with requests.Session() as s:
         s.headers.update(API_KEY)
@@ -205,20 +286,53 @@ def main():
         print(f"Position Limit: ±{POSITION_LIMIT:,} shares (gross/net)")
         print(f"Max Order Size: {MAX_ORDER_SIZE:,} shares")
         print(f"Rate Limit: {ORDER_LIMIT} orders/second")
-        print(f"Min Profit Threshold: ${MIN_PROFIT_THRESHOLD:.2f}")
-        print(f"Strategy: VWAP-based market orders with profit filtering")
+        print(f"Min Price Difference: ${MIN_PRICE_DIFFERENCE:.2f} (~${MIN_PRICE_DIFFERENCE * MAX_ORDER_SIZE:.0f} profit)")
+        print(f"Strategy: VWAP-based market orders with price spread filtering")
         print("="*70 + "\n")
         
-        tick, status = get_tick(s)
-        opportunities_found = 0
-        opportunities_skipped = 0
-        trades_executed = 0
-        total_profit = 0
+        # Wait for case to start
+        if not wait_for_case_start(s):
+            print("❌ Shutdown before case started")
+            return
         
         print("🤖 Bot started. Monitoring markets for profitable arbitrage...\n")
         
-        while tick <= 300 and status == 'ACTIVE' and not shutdown:
+        last_period = 0
+        last_status = 'ACTIVE'
+        
+        while not shutdown:
             try:
+                tick, status, period = get_tick(s)
+                
+                # Check if we've moved to a new period (case restarted)
+                if period != last_period:
+                    if last_period > 0:
+                        # Case restarted - print stats for previous period
+                        print_period_stats(s, last_period)
+                        print(f"🔄 Starting new period {period}...\n")
+                        
+                        # Reset counters for new period
+                        opportunities_found = 0
+                        opportunities_skipped = 0
+                        trades_executed = 0
+                        evaluations = 0
+                        expected_total_profit = 0
+                    
+                    last_period = period
+                
+                # Check if case just stopped (was ACTIVE, now is not)
+                if last_status == 'ACTIVE' and status != 'ACTIVE':
+                    # Case just stopped - print stats
+                    print_period_stats(s, period)
+                    print(f"⏸️  Case is {status}. Waiting for next period...\n")
+                
+                last_status = status
+                
+                # Check if case is not active
+                if status != 'ACTIVE':
+                    sleep(0.5)
+                    continue
+                
                 # Get current limits
                 gross_position, net_position, gross_limit, net_limit = get_limits(s)
                 
@@ -229,9 +343,8 @@ def main():
                 )
                 
                 if remaining_capacity <= 0:
-                    print("⚠ Position limit reached. Waiting...")
-                    # sleep(1)
-                    tick, status = get_tick(s)
+                    print(f"⚠ Position limit reached (Tick {tick}). Waiting...")
+                    sleep(1)
                     continue
                 
                 # Get order books with more depth
@@ -239,71 +352,73 @@ def main():
                 
                 # Check if books have valid data
                 if not crzy_m_book.get('bids') or not crzy_m_book.get('asks'):
-                    tick, status = get_tick(s)
-                    # sleep(0.1)
+                    sleep(0.1)
                     continue
                     
                 if not crzy_a_book.get('bids') or not crzy_a_book.get('asks'):
-                    tick, status = get_tick(s)
-                    # sleep(0.1)
+                    sleep(0.1)
                     continue
+                
+                # Increment evaluation counter
+                evaluations += 1
                 
                 # Calculate maximum quantity we can trade (before checking arbitrage)
                 max_quantity = min(MAX_ORDER_SIZE, remaining_capacity)
                 
+                best_opportunity = None
+                best_profit = 0
+                best_spread = 0
+                
                 # Opportunity 1: Buy on Main, Sell on Alternate (M ask < A bid)
-                # Calculate VWAP for buying on Main
                 buy_m_vwap, buy_m_qty, _ = calculate_vwap_and_quantity(crzy_m_book['asks'], max_quantity)
-                # Calculate VWAP for selling on Alternate
                 sell_a_vwap, sell_a_qty, _ = calculate_vwap_and_quantity(crzy_a_book['bids'], max_quantity)
                 
                 if buy_m_vwap is not None and sell_a_vwap is not None:
-                    # Adjust quantity to what's actually available
                     available_quantity = min(buy_m_qty, sell_a_qty, max_quantity)
+                    price_spread = sell_a_vwap - buy_m_vwap
                     
-                    if available_quantity > 0 and sell_a_vwap > buy_m_vwap:
-                        expected_profit = (sell_a_vwap - buy_m_vwap) * available_quantity
+                    if available_quantity > 0 and price_spread > 0:
+                        expected_profit = price_spread * available_quantity
                         
-                        if expected_profit >= MIN_PROFIT_THRESHOLD:
-                            opportunities_found += 1
-                            if execute_arbitrage(s, 'CRZY_M', 'CRZY_A', available_quantity, 
-                                               buy_m_vwap, sell_a_vwap, expected_profit):
-                                trades_executed += 1
-                                total_profit += expected_profit
-                        else:
-                            opportunities_skipped += 1
-                            if opportunities_skipped % 10 == 0:  # Only print occasionally
-                                print(f"⏭️  Skipped small opportunity: ${expected_profit:.2f} profit (< ${MIN_PROFIT_THRESHOLD})")
+                        if expected_profit > best_profit:
+                            best_profit = expected_profit
+                            best_spread = price_spread
+                            best_opportunity = ('CRZY_M', 'CRZY_A', available_quantity, buy_m_vwap, sell_a_vwap, expected_profit)
                 
                 # Opportunity 2: Buy on Alternate, Sell on Main (A ask < M bid)
-                # Calculate VWAP for buying on Alternate
                 buy_a_vwap, buy_a_qty, _ = calculate_vwap_and_quantity(crzy_a_book['asks'], max_quantity)
-                # Calculate VWAP for selling on Main
                 sell_m_vwap, sell_m_qty, _ = calculate_vwap_and_quantity(crzy_m_book['bids'], max_quantity)
                 
                 if buy_a_vwap is not None and sell_m_vwap is not None:
-                    # Adjust quantity to what's actually available
                     available_quantity = min(buy_a_qty, sell_m_qty, max_quantity)
+                    price_spread = sell_m_vwap - buy_a_vwap
                     
-                    if available_quantity > 0 and sell_m_vwap > buy_a_vwap:
-                        expected_profit = (sell_m_vwap - buy_a_vwap) * available_quantity
+                    if available_quantity > 0 and price_spread > 0:
+                        expected_profit = price_spread * available_quantity
                         
-                        if expected_profit >= MIN_PROFIT_THRESHOLD:
-                            opportunities_found += 1
-                            if execute_arbitrage(s, 'CRZY_A', 'CRZY_M', available_quantity, 
-                                               buy_a_vwap, sell_m_vwap, expected_profit):
-                                trades_executed += 1
-                                total_profit += expected_profit
-                        else:
-                            opportunities_skipped += 1
-                            if opportunities_skipped % 10 == 0:  # Only print occasionally
-                                print(f"⏭️  Skipped small opportunity: ${expected_profit:.2f} profit (< ${MIN_PROFIT_THRESHOLD})")
+                        if expected_profit > best_profit:
+                            best_profit = expected_profit
+                            best_spread = price_spread
+                            best_opportunity = ('CRZY_A', 'CRZY_M', available_quantity, buy_a_vwap, sell_m_vwap, expected_profit)
                 
-                # Update tick
-                tick, status = get_tick(s)
+                # Print evaluation status and execute if spread is large enough
+                if best_opportunity:
+                    if best_spread > MIN_PRICE_DIFFERENCE:
+                        print(f"✨ [Tick {tick:3d}] Evaluation #{evaluations}: EXECUTING trade, spread=${best_spread:.4f}, profit=${best_profit:.2f}")
+                        opportunities_found += 1
+                        buy_tkr, sell_tkr, qty, buy_vwap, sell_vwap, profit = best_opportunity
+                        if execute_arbitrage(s, buy_tkr, sell_tkr, qty, buy_vwap, sell_vwap, profit):
+                            trades_executed += 1
+                    else:
+                        opportunities_skipped += 1
+                        print(f"⏭️  [Tick {tick:3d}] Evaluation #{evaluations}: Small spread ${best_spread:.4f} < ${MIN_PRICE_DIFFERENCE:.2f} (profit=${best_profit:.2f}, skipped)")
+                else:
+                    # Print status every 20 evaluations to show we're alive
+                    if evaluations % 20 == 0:
+                        print(f"🔍 [Tick {tick:3d}] Evaluation #{evaluations}: No arbitrage opportunity (markets aligned)")
                 
-                # Small delay to avoid hammering the API unnecessarily
-                sleep(0.05)
+                # Shorter delay between iterations
+                # sleep(0.02)
                 
             except KeyboardInterrupt:
                 shutdown = True
@@ -312,14 +427,24 @@ def main():
                 print(f"❌ Error: {e}")
                 sleep(0.5)
         
+        # Final stats when manually stopped
         print("\n" + "="*70)
-        print("🛑 Bot stopped.")
-        print(f"📊 Statistics:")
+        print("🛑 Bot manually stopped.")
+        print(f"📊 Final Statistics:")
+        print(f"   Evaluations: {evaluations}")
         print(f"   Profitable opportunities found: {opportunities_found}")
         print(f"   Small opportunities skipped: {opportunities_skipped}")
         print(f"   Trades executed: {trades_executed}")
-        print(f"   Total orders: {number_of_orders}")
-        print(f"   Expected total profit: ${total_profit:.2f}")
+        print(f"   Total orders submitted: {number_of_orders}")
+        print(f"   Expected total profit: ${expected_total_profit:.2f}")
+        
+        # Get actual realized profit from server
+        try:
+            actual_profit = get_realized_profits(s)
+            print(f"   💰 Actual realized profit: ${actual_profit:.2f}")
+        except:
+            print(f"   💰 Could not retrieve actual profit from server")
+        
         print("="*70 + "\n")
 
 if __name__ == '__main__':

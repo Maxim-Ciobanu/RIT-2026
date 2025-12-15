@@ -27,13 +27,19 @@ POSITION_LIMIT = 25000
 number_of_orders = 0
 total_speedbumps = 0
 
+# Statistics tracking
+opportunities_found = 0
+trades_executed = 0
+evaluations = 0
+expected_total_profit = 0
+
 def get_tick(session):
     """Get current tick of the case"""
     resp = session.get(f'http://localhost:{Port}/v1/case')
     if resp.status_code == 401:
         raise ApiException('API key mismatch')
     case = resp.json()
-    return case['tick'], case['status']
+    return case['tick'], case['status'], case['period']
 
 def get_limits(session):
     """Get current trading limits"""
@@ -49,8 +55,23 @@ def get_limits(session):
     
     return 0, 0, POSITION_LIMIT, POSITION_LIMIT
 
+def get_realized_profits(session):
+    """Get actual realized profits from the server"""
+    resp = session.get(f'http://localhost:{Port}/v1/securities')
+    if resp.status_code == 401:
+        raise ApiException('API key mismatch')
+    
+    securities = resp.json()
+    total_realized = 0
+    
+    for security in securities:
+        if security['ticker'] in ['CRZY_M', 'CRZY_A']:
+            total_realized += security.get('realized', 0)
+    
+    return total_realized
+
 def get_order_books(session):
-    """Get order books for both exchanges"""
+    """Get order books for both exchanges - TOP OF BOOK ONLY"""
     crzy_m_resp = session.get(f'http://localhost:{Port}/v1/securities/book?ticker=CRZY_M&limit=1')
     crzy_a_resp = session.get(f'http://localhost:{Port}/v1/securities/book?ticker=CRZY_A&limit=1')
     
@@ -100,19 +121,22 @@ def speedbump(transaction_time):
     # Increment order counter
     number_of_orders = number_of_orders + 1
     
-    # Sleep for average speed bump
+    # Sleep for average speed bump (only if positive)
     avg_speedbump = total_speedbumps / number_of_orders
     if avg_speedbump > 0:
         sleep(avg_speedbump)
 
 def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, buy_price, sell_price):
     """Execute arbitrage by buying on one exchange and selling on the other"""
+    global expected_total_profit
+    
+    expected_profit = (sell_price - buy_price) * quantity
     
     print(f"\n{'='*70}")
     print(f"🎯 ARBITRAGE OPPORTUNITY DETECTED!")
-    print(f"   Buy  {quantity:,} shares on {buy_ticker} @ ~${buy_price:.2f}")
-    print(f"   Sell {quantity:,} shares on {sell_ticker} @ ~${sell_price:.2f}")
-    print(f"   Expected profit: ${(sell_price - buy_price) * quantity:.2f}")
+    print(f"   Buy  {quantity:,} shares on {buy_ticker} @ ${buy_price:.2f}")
+    print(f"   Sell {quantity:,} shares on {sell_ticker} @ ${sell_price:.2f}")
+    print(f"   Expected profit: ${expected_profit:.2f}")
     print(f"{'='*70}")
     
     # Execute buy order
@@ -142,34 +166,121 @@ def execute_arbitrage(session, buy_ticker, sell_ticker, quantity, buy_price, sel
     # Calculate actual profit
     filled_quantity = min(buy_order['quantity_filled'], sell_order['quantity_filled'])
     actual_profit = (sell_order['vwap'] - buy_order['vwap']) * filled_quantity
+    
+    # Add to expected total profit
+    expected_total_profit += expected_profit
+    
     print(f"💰 Actual profit: ${actual_profit:.2f}")
     print(f"{'='*70}\n")
     
     return True
 
+def wait_for_case_start(session):
+    """Wait for the case to start (status = ACTIVE and ticks moving)"""
+    print("⏳ Waiting for case to start...")
+    
+    last_tick = -1
+    while not shutdown:
+        try:
+            tick, status, period = get_tick(session)
+            
+            if status == 'ACTIVE':
+                if tick > last_tick or tick == 0:
+                    print(f"✅ Case is ACTIVE! Period {period}, Tick {tick}")
+                    return True
+                else:
+                    print(f"   Case ACTIVE but ticks not moving... Tick: {tick}")
+            else:
+                print(f"   Case status: {status}, waiting...")
+            
+            last_tick = tick
+            sleep(0.5)
+            
+        except Exception as e:
+            print(f"   Error checking case status: {e}")
+            sleep(2)
+    
+    return False
+
+def print_period_stats(session, period):
+    """Print statistics for the completed period"""
+    print("\n" + "="*70)
+    print(f"📊 PERIOD {period} COMPLETED - Statistics:")
+    print(f"   Evaluations: {evaluations}")
+    print(f"   Opportunities found: {opportunities_found}")
+    print(f"   Trades executed: {trades_executed}")
+    print(f"   Total orders submitted: {number_of_orders}")
+    print(f"   Expected total profit: ${expected_total_profit:.2f}")
+    
+    # Get actual realized profit from server
+    try:
+        actual_profit = get_realized_profits(session)
+        print(f"   💰 Actual realized profit: ${actual_profit:.2f}")
+    except Exception as e:
+        print(f"   💰 Could not retrieve actual profit from server: {e}")
+    
+    print("="*70 + "\n")
+
 def main():
-    global shutdown
+    global shutdown, opportunities_found, trades_executed, evaluations, expected_total_profit
+    global number_of_orders, total_speedbumps
     
     with requests.Session() as s:
         s.headers.update(API_KEY)
         
         print("\n" + "="*70)
-        print(" ALGORITHMIC ARBITRAGE BOT - ALGO1 Case")
+        print(" ALGORITHMIC ARBITRAGE BOT - ALGO1 Case (Simple Edition)")
         print("="*70)
         print(f"Position Limit: ±{POSITION_LIMIT:,} shares (gross/net)")
         print(f"Max Order Size: {MAX_ORDER_SIZE:,} shares")
         print(f"Rate Limit: {ORDER_LIMIT} orders/second")
-        print(f"Strategy: Market orders for immediate execution")
+        print(f"Strategy: Top-of-book market orders - FAST execution")
         print("="*70 + "\n")
         
-        tick, status = get_tick(s)
-        opportunities_found = 0
-        trades_executed = 0
+        # Wait for case to start
+        if not wait_for_case_start(s):
+            print("❌ Shutdown before case started")
+            return
         
         print("🤖 Bot started. Monitoring markets for arbitrage opportunities...\n")
         
-        while tick <= 300 and status == 'ACTIVE' and not shutdown:
+        last_period = 0
+        last_status = 'ACTIVE'
+        
+        while not shutdown:
             try:
+                tick, status, period = get_tick(s)
+                
+                # Check if we've moved to a new period (case restarted)
+                if period != last_period:
+                    if last_period > 0:
+                        # Case restarted - print stats for previous period
+                        print_period_stats(s, last_period)
+                        print(f"🔄 Starting new period {period}...\n")
+                        
+                        # Reset counters for new period
+                        opportunities_found = 0
+                        trades_executed = 0
+                        evaluations = 0
+                        expected_total_profit = 0
+                        number_of_orders = 0
+                        total_speedbumps = 0
+                    
+                    last_period = period
+                
+                # Check if case just stopped (was ACTIVE, now is not)
+                if last_status == 'ACTIVE' and status != 'ACTIVE':
+                    # Case just stopped - print stats
+                    print_period_stats(s, period)
+                    print(f"⏸️  Case is {status}. Waiting for next period...\n")
+                
+                last_status = status
+                
+                # Check if case is not active
+                if status != 'ACTIVE':
+                    sleep(0.5)
+                    continue
+                
                 # Get current limits
                 gross_position, net_position, gross_limit, net_limit = get_limits(s)
                 
@@ -180,24 +291,24 @@ def main():
                 )
                 
                 if remaining_capacity <= 0:
-                    print("⚠ Position limit reached. Waiting...")
+                    print(f"⚠ Position limit reached (Tick {tick}). Waiting...")
                     sleep(1)
-                    tick, status = get_tick(s)
                     continue
                 
-                # Get order books
+                # Get order books (TOP OF BOOK ONLY - fast!)
                 crzy_m_book, crzy_a_book = get_order_books(s)
                 
                 # Check if books have valid data
                 if not crzy_m_book.get('bids') or not crzy_m_book.get('asks'):
-                    tick, status = get_tick(s)
                     sleep(0.1)
                     continue
                     
                 if not crzy_a_book.get('bids') or not crzy_a_book.get('asks'):
-                    tick, status = get_tick(s)
                     sleep(0.1)
                     continue
+                
+                # Increment evaluation counter
+                evaluations += 1
                 
                 # Extract best bid/ask for both exchanges
                 crzy_m_bid = crzy_m_book['bids'][0]['price']
@@ -244,11 +355,9 @@ def main():
                         if execute_arbitrage(s, 'CRZY_A', 'CRZY_M', max_quantity, crzy_a_ask, crzy_m_bid):
                             trades_executed += 1
                 
-                # Update tick
-                tick, status = get_tick(s)
-                
-                # Small delay to avoid hammering the API unnecessarily
-                # sleep(0.05)
+                # Print status every 50 evaluations to show we're alive
+                elif evaluations % 50 == 0:
+                    print(f"🔍 [Tick {tick:3d}] Evaluation #{evaluations}: No arbitrage (M: {crzy_m_bid:.2f}/{crzy_m_ask:.2f}, A: {crzy_a_bid:.2f}/{crzy_a_ask:.2f})")
                 
             except KeyboardInterrupt:
                 shutdown = True
@@ -257,12 +366,23 @@ def main():
                 print(f"❌ Error: {e}")
                 sleep(0.5)
         
+        # Final stats when manually stopped
         print("\n" + "="*70)
-        print("🛑 Bot stopped.")
-        print(f"📊 Statistics:")
+        print("🛑 Bot manually stopped.")
+        print(f"📊 Final Statistics:")
+        print(f"   Evaluations: {evaluations}")
         print(f"   Opportunities found: {opportunities_found}")
         print(f"   Trades executed: {trades_executed}")
-        print(f"   Total orders: {number_of_orders}")
+        print(f"   Total orders submitted: {number_of_orders}")
+        print(f"   Expected total profit: ${expected_total_profit:.2f}")
+        
+        # Get actual realized profit from server
+        try:
+            actual_profit = get_realized_profits(s)
+            print(f"   💰 Actual realized profit: ${actual_profit:.2f}")
+        except:
+            print(f"   💰 Could not retrieve actual profit from server")
+        
         print("="*70 + "\n")
 
 if __name__ == '__main__':

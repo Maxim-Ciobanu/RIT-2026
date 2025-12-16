@@ -3,7 +3,7 @@ import signal
 import time
 from time import sleep
 
-Port = 10007
+Port = 10006
 
 class ApiException(Exception):
     pass
@@ -356,7 +356,7 @@ def main():
                             trades_executed += 1
                 
                 # Print status every 50 evaluations to show we're alive
-                elif evaluations % 50 == 0:
+                elif evaluations % 20 == 0:
                     print(f"🔍 [Tick {tick:3d}] Evaluation #{evaluations}: No arbitrage (M: {crzy_m_bid:.2f}/{crzy_m_ask:.2f}, A: {crzy_a_bid:.2f}/{crzy_a_ask:.2f})")
                 
             except KeyboardInterrupt:

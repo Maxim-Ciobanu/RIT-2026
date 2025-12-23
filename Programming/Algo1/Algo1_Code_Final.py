@@ -3,7 +3,7 @@ import signal
 import time
 from time import sleep
 
-Port = 10011
+Port = 10010
 
 class ApiException(Exception):
     pass
